@@ -1,11 +1,13 @@
 import socket
 import struct
 import time
+import sys
 
 # --- Protocol & Game Constants ---
+# Protocol constants must match the server's values
 MAGIC_COOKIE = 0xabcddcba  # Every packet must start with this header
 UDP_PORT = 13122           # Mandatory port for server discovery
-TEAM_NAME = "Diagonal Shooters".ljust(32)[:32]  # Fixed 32-byte name
+TEAM_NAME = "Diagonal Shooters".ljust(32)[:32]  # Fixed 32-byte name (32 bytes)
 
 # Mapping for pretty printing
 SUITS = {0: '❤️', 1: '♦️', 2: '♣️', 3: '♠️'}
@@ -33,24 +35,33 @@ def start_client():
         
         try:
             # Step 1: Discover Server
-            udp_sock.settimeout(10.0) # Prevents waiting forever
+            udp_sock.settimeout(10.0) # Prevents waiting forever for offers
             data, addr = udp_sock.recvfrom(1024)
-            
-            # Unpack the 39-byte offer
+
+            # Offer packet: MagicCookie(4) | MsgType(1) | TCPPort(2) | ServerName(32)
+            # Expect at least 39 bytes for a valid offer
             if len(data) < 39: continue
             cookie, msg_type, tcp_port, server_name = struct.unpack('>IBH32s', data[:39])
-            
+
+            # Validate cookie and message type
             if cookie != MAGIC_COOKIE or msg_type != 0x2: continue
-            
+
             print(f"🤘 Found Server: {server_name.decode(errors='ignore').strip()} at {addr[0]}")
             udp_sock.close()
 
             # Step 2: Play Session
-            while True:
-                num_rounds = int(input("How many rounds will you play? "))
-                if num_rounds != 0:
-                    break
-                
+            # Ask the user how many rounds to play. Entering `0` will exit the client.
+            try:
+                num_rounds = int(input("How many rounds will you play? (0 to quit) "))
+            except ValueError:
+                print("❌ Use numbers for rounds!")
+                return
+
+            if num_rounds == 0:
+                print("Exiting client as requested (0 rounds).")
+                return
+
+            # Session statistics collected locally for display at the end
             stats = {
                 "wins": 0, "losses": 0, "ties": 0,
                 "total_hits": 0, "busts": 0, "aces_drawn": 0,
@@ -63,6 +74,7 @@ def start_client():
                 tcp_sock.connect((addr[0], tcp_port))
                 
                 # Send Request Packet
+                # Build and send the Request packet: MagicCookie | MsgType(REQUEST) | Rounds | TeamName
                 request = struct.pack('>IBB32s', MAGIC_COOKIE, 0x3, num_rounds, TEAM_NAME.encode())
                 tcp_sock.send(request)
                 
@@ -87,13 +99,13 @@ def play_round(sock, stats):
     player_hand = []
     dealer_hand = []
     
-    # Step A: Initial Deal (Server sends 2 player cards and 1 dealer card)
+    # Step A: Initial Deal (server will send 3 payloads: players two cards + dealers visible card)
     for _ in range(3):
         res, rank, suit = safe_recv(sock)
-        if _ < 2: 
+        if _ < 2:
             player_hand.append((rank, suit))
             if rank == 1: stats["aces_drawn"] += 1
-        else: 
+        else:
             dealer_hand.append((rank, suit))
 
     # Step B: Player Turn
@@ -103,6 +115,7 @@ def play_round(sock, stats):
         print(f"Dealer Shows: {format_hand(dealer_hand)}")
         
         if p_sum > 21:
+            # Player exceeded 21 and immediately busts
             print("💥 BUSTED!")
             stats["busts"] += 1
             break
@@ -114,13 +127,14 @@ def play_round(sock, stats):
                 break
             print("❌ Invalid input! Type 'h' to Hit or 's' to Stand.")
 
-        # Map the single character to the 5-byte protocol string 
+        # Map the single character to the 5-byte protocol decision string
+        # and send as: MagicCookie | MsgType(PAYLOAD) | 5-byte decision
         decision = "Hittt" if choice == 'h' else "Stand"
         sock.send(struct.pack('>IB5s', MAGIC_COOKIE, 0x4, decision.encode().ljust(5)))
         
         if decision == "Stand": break
         
-        # Get the new card from Hit
+        # Get the new card from Hit and update stats
         stats["total_hits"] += 1
         res, rank, suit = safe_recv(sock)
         player_hand.append((rank, suit))
@@ -128,17 +142,18 @@ def play_round(sock, stats):
 
     # Step C: Result Phase (Reveal Dealer Cards and Final Outcome)
     print("\n--- Dealer's Turn ---")
+    # Step C: Dealer and result notifications — server will stream dealer cards
     while True:
         res, rank, suit = safe_recv(sock)
-        
-        # If the server sends a card, add it to dealer's hand and show it
+
+        # If the server sends a card (rank != 0), add and print it
         if rank != 0:
             dealer_hand.append((rank, suit))
             print(f"Dealer draws: {get_card_str(rank, suit)}")
             if calculate_points([(rank, suit)]) > 21: # Simplified dealer bust check
                 stats["dealer_busts"] += 1
 
-        # Check for the final result code (Win/Loss/Tie) 
+        # When a non-zero result code arrives round is complete
         if res != 0:
             print(f"Dealer's Final Hand: {format_hand(dealer_hand)} (Total: {calculate_points(dealer_hand)})")
             status = {0x3: "WINNER! 🏆", 0x2: "LOSER... 💀", 0x1: "TIE 🤝"}.get(res, "Unknown")
@@ -146,22 +161,25 @@ def play_round(sock, stats):
             return res
 
 def safe_recv(sock):
-    """Reliably receives 9-byte payload packets and validates the cookie."""
-    try:
-        data = sock.recv(9)
-        if len(data) < 9: 
-            raise ConnectionError("Server disconnected mid-round")
-        
-        # Unpack: Cookie(4), MsgType(1), Result(1), RankHigh(1), RankLow(1), Suit(1)
-        cookie, msg_type, res, r_h, r_l, suit = struct.unpack('>IBB3B', data)
-        
-        if cookie != MAGIC_COOKIE:
-            raise ValueError("Corrupted packet (Wrong Cookie)")
-            
-        return res, (r_h << 8) | r_l, suit
-    except Exception as e:
-        print(f"Error receiving data: {e}")
-        return 0, 0, 0
+    """Receive a 9-byte payload and validate it.
+
+    On socket errors or protocol corruption this function now raises
+    `ConnectionError` so the caller (the main loop) can stop the session
+    and return to server discovery.
+    """
+    data = sock.recv(9)
+    if len(data) < 9:
+        # Let the caller handle the disconnection
+        raise ConnectionError("Server disconnected mid-round")
+
+    # Unpack: Cookie(4), MsgType(1), Result(1), RankHigh(1), RankLow(1), Suit(1)
+    cookie, msg_type, res, r_h, r_l, suit = struct.unpack('>IBB3B', data)
+
+    if cookie != MAGIC_COOKIE:
+        # Treat protocol corruption as a connection-level failure
+        raise ConnectionError("Corrupted packet (Wrong Cookie)")
+
+    return res, (r_h << 8) | r_l, suit
 
 def calculate_points(hand):
     """Calculates blackjack total where Ace=11 and Face=10."""

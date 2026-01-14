@@ -3,99 +3,157 @@ import struct
 import threading
 import time
 import random
+import traceback
 
 # --- Protocol Constants ---
+# Magic cookie is used to identify and validate protocol packets
 MAGIC_COOKIE = 0xabcddcba 
+# UDP port used by clients to listen for server offers
 UDP_PORT = 13122          
-OFFER_TYPE = 0x2          
-REQUEST_TYPE = 0x3        
-PAYLOAD_TYPE = 0x4        
+# Offer/Request/Payload message type identifiers used in UDP/TCP headers
+OFFER_TYPE = 0x2    
+REQUEST_TYPE = 0x3
+PAYLOAD_TYPE = 0x4
+# 32-byte server name field used in the offer packet (fixed size)
 SERVER_NAME = "Nadav's Rocking Casino".ljust(32)[:32] 
 
 class BlackijeckyServer:
+    """Server that broadcasts offers over UDP and handles game sessions over TCP.
+
+    The server uses a UDP offer packet to announce its TCP port and then
+    accepts multiple TCP player connections. Each player is handled in its
+    own thread so concurrent sessions are possible.
+    """
     def __init__(self, host='0.0.0.0'):
-        """Initializes the server and global casino statistics."""
+        """Initialize listening TCP socket and shared statistics."""
         self.host = host
+        # TCP socket for incoming player connections (port chosen by OS)
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.bind((self.host, 0))
+        # Remember which TCP port we received so it can be advertised
         self.tcp_port = self.tcp_sock.getsockname()[1]
         self.tcp_sock.listen(10)
         
-        # Global stats across all players
+        # Global aggregated stats across all players (thread-safe)
         self.total_wins = 0
         self.total_losses = 0
         self.total_ties = 0
         self.stats_lock = threading.Lock() # Ensures thread-safety for global stats
 
     def broadcast_offers(self):
-        """Broadcasts server presence every second."""
+        """Broadcasts server presence every second.
+
+        Creates a UDP broadcast socket and repeatedly sends an offer packet.
+        Offer packet format: MagicCookie(4) | MsgType(1) | TCPPort(2) | ServerName(32)
+        """
+        # UDP socket used for broadcast discovery
         broadcast_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         broadcast_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         packet = struct.pack('>IBH32s', MAGIC_COOKIE, OFFER_TYPE, self.tcp_port, SERVER_NAME.encode())
-        
+
         print(f"🎸 Casino is open! Broadcasting on port {self.tcp_port}...")
+        # Continuously broadcast offers so clients can discover this server
         while True:
             try:
                 broadcast_sock.sendto(packet, ('<broadcast>', UDP_PORT))
                 time.sleep(1) # Frequency limit
             except Exception as e:
+                # Keep broadcasting even if an occasional send fails
                 print(f"Broadcast error: {e}")
 
-    def deal_card(self):
-        """Standard 52-card deck logic."""
-        rank = random.randint(1, 13) 
-        suit = random.randint(0, 3)  
-        if rank == 1: value = 11      
-        elif rank >= 11: value = 10   
-        else: value = rank           
+    def draw_card_from_deck(self, deck):
+        """Pop a card from the provided deck list (no replacement within round).
+
+        `deck` is a list of (rank, suit) tuples. This method returns (rank, suit, value).
+        """
+        if not deck:
+            # Defensive: if deck is empty (very unlikely within one round), recreate it
+            deck.extend(self.new_shuffled_deck())
+        rank, suit = deck.pop()
+
+        # Compute blackjack value
+        if rank == 1:
+            value = 11
+        elif rank >= 11:
+            value = 10
+        else:
+            value = rank
         return rank, suit, value
 
+    def new_shuffled_deck(self):
+        """Return a new shuffled 52-card deck as a list of (rank, suit) tuples."""
+        deck = [(rank, suit) for rank in range(1, 14) for suit in range(0, 4)]
+        random.shuffle(deck)
+        return deck
+
     def update_global_stats(self, result):
-        """Thread-safe update of the casino win/loss records."""
+        """Thread-safe update of the casino win/loss records.
+
+        `result` uses protocol result codes: 0x3=player win, 0x2=player loss, 0x1=tie
+        """
         with self.stats_lock:
             if result == 0x3: self.total_losses += 1 # Server loss = Player win
             elif result == 0x2: self.total_wins += 1 # Server win = Player loss
             else: self.total_ties += 1
-            
+
             total_games = self.total_wins + self.total_losses + self.total_ties
             win_pct = (self.total_wins / total_games) * 100
             print(f"📊 [CASINO STATS] Total Games: {total_games} | House Win Rate: {win_pct:.1f}%")
 
     def handle_client(self, conn, addr):
-        """Manages a player's session with detailed activity logging."""
+        """Manages a player's session with detailed activity logging.
+
+        Expects an initial Request packet from the client containing number of
+        rounds and the 32-byte team name. Plays that many rounds sequentially
+        for the connected client in this thread.
+        """
         try:
             data = conn.recv(1024)
             if not data or len(data) < 38: return
-            
+
+            # Request packet: MagicCookie(4) | MsgType(1) | Rounds(1) | TeamName(32)
             cookie, msg_type, rounds, team_name = struct.unpack('>IBB32s', data[:38])
             if cookie != MAGIC_COOKIE or msg_type != REQUEST_TYPE: return
-            
+
             team_name = team_name.decode(errors='ignore').strip('\x00')
             print(f"\n🔥 [NEW PLAYER] Team '{team_name}' connected from {addr[0]}")
             print(f"🃏 Preparing to play {rounds} rounds...")
 
             for r_idx in range(rounds):
                 print(f"--- Round {r_idx + 1} with {team_name} ---")
-                result = self.play_round(conn, team_name)
+                # Each client gets their own dealer deck which is reshuffled before each round
+                deck = self.new_shuffled_deck()
+                result = self.play_round(conn, team_name, deck)
                 self.update_global_stats(result)
-                
+
             print(f"🤘 Session finished for {team_name}. Connection closing.")
         except Exception as e:
+            # Print full traceback for easier debugging while keeping server running
             print(f"⚠️ [ERROR] Connection with {addr} failed: {e}")
+            print(traceback.format_exc())
         finally:
             conn.close()
 
-    def play_round(self, conn, team_name):
-        """Executes the round and prints every step of the game."""
+    def play_round(self, conn, team_name, deck):
+        """Executes the round and prints every step of the game.
+
+        Round flow:
+        1. Deal two cards to player and two to dealer (one dealer card hidden)
+        2. Send player's two cards and dealer's visible card to the client
+        3. Receive player's Hit/Stand decisions and send new cards on Hit
+        4. Reveal dealer's hidden card and play dealer behavior (hit until 17)
+        5. Determine and send final result
+        """
         # Initial Deal
-        p_c1_r, p_c1_s, p_c1_v = self.deal_card()
-        p_c2_r, p_c2_s, p_c2_v = self.deal_card()
-        d_c1_r, d_c1_s, d_c1_v = self.deal_card() 
-        d_c2_r, d_c2_s, d_c2_v = self.deal_card() 
+        p_c1_r, p_c1_s, p_c1_v = self.draw_card_from_deck(deck)
+        p_c2_r, p_c2_s, p_c2_v = self.draw_card_from_deck(deck)
+        d_c1_r, d_c1_s, d_c1_v = self.draw_card_from_deck(deck)
+        d_c2_r, d_c2_s, d_c2_v = self.draw_card_from_deck(deck)
 
         player_sum = p_c1_v + p_c2_v
         dealer_sum = d_c1_v + d_c2_v
 
+        # Send initial visible cards: players two cards and dealers one visible card
         print(f"   Dealing initial cards to {team_name}...")
         for r, s in [(p_c1_r, p_c1_s), (p_c2_r, p_c2_s), (d_c1_r, d_c1_s)]:
             self.send_payload(conn, 0x0, r, s)
@@ -103,16 +161,34 @@ class BlackijeckyServer:
         # Player Phase
         while player_sum <= 21:
             data = conn.recv(1024)
-            if not data: break
-            _, _, decision_bytes = struct.unpack('>IB5s', data)
-            decision = decision_bytes.decode().strip('\x00').strip()
+            if not data:
+                # client disconnected or sent empty payload: end player's turn
+                print("   [INFO] No data from client — ending player phase.")
+                break
 
+            # Defensive: ensure we have at least 10 bytes for the decision packet
+            if len(data) < 10:
+                print(f"   [WARN] Received short packet ({len(data)} bytes). Ignoring and ending player phase.")
+                break
+
+            # Unpack only the first 10 bytes (I, B, 5s)
+            cookie, msg_type, decision_bytes = struct.unpack('>IB5s', data[:10])
+            # Validate cookie and message type (expect PAYLOAD_TYPE)
+            if cookie != MAGIC_COOKIE or msg_type != PAYLOAD_TYPE:
+                print("   [WARN] Invalid decision packet received. Ignoring and ending player phase.")
+                break
+
+            decision = decision_bytes.decode(errors='ignore').strip('\x00').strip()
             print(f"   {team_name} chose to: {decision}")
             if decision == "Hittt":
-                r, s, v = self.deal_card()
+                r, s, v = self.draw_card_from_deck(deck)
                 player_sum += v
                 print(f"   -> Dealt rank {r}. {team_name} total is now {player_sum}.")
-                self.send_payload(conn, 0x0, r, s)
+                try:
+                    self.send_payload(conn, 0x0, r, s)
+                except Exception:
+                    print("   [ERROR] Failed to send card to client during Hit; ending round.")
+                    break
             else:
                 break
 
@@ -122,7 +198,7 @@ class BlackijeckyServer:
         
         if player_sum <= 21:
             while dealer_sum < 17:
-                r, s, v = self.deal_card()
+                r, s, v = self.draw_card_from_deck(deck)
                 dealer_sum += v
                 print(f"   -> Dealer hits! Draws rank {r}. Dealer total: {dealer_sum}.")
                 self.send_payload(conn, 0x0, r, s)
@@ -145,11 +221,16 @@ class BlackijeckyServer:
         else:
             print(f"   Result: It's a tie at {player_sum} points.")
         
+        # Send a final payload with the result code (rank and suit zeroed)
         self.send_payload(conn, result, 0, 0)
         return result
 
     def send_payload(self, conn, result, rank, suit):
-        """Binary encoding for game messages."""
+        """Binary encoding for game messages.
+
+        Payload structure (9 bytes): MagicCookie(4) | MsgType(1) | Result(1) |
+        RankHigh(1) | RankLow(1) | Suit(1)
+        """
         rank_h, rank_l = (rank >> 8) & 0xFF, rank & 0xFF
         packet = struct.pack('>IBB3B', MAGIC_COOKIE, PAYLOAD_TYPE, result, rank_h, rank_l, suit)
         conn.send(packet)
