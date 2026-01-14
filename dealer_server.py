@@ -9,13 +9,13 @@ import traceback
 # Magic cookie is used to identify and validate protocol packets
 MAGIC_COOKIE = 0xabcddcba 
 # UDP port used by clients to listen for server offers
-UDP_PORT = 13122          
+UDP_PORT = 13122
 # Offer/Request/Payload message type identifiers used in UDP/TCP headers
 OFFER_TYPE = 0x2    
 REQUEST_TYPE = 0x3
 PAYLOAD_TYPE = 0x4
 # 32-byte server name field used in the offer packet (fixed size)
-SERVER_NAME = "Nadav's Rocking Casino".ljust(32)[:32] 
+SERVER_NAME = "Rocking Casino".ljust(32)[:32] 
 
 class BlackijeckyServer:
     """Server that broadcasts offers over UDP and handles game sessions over TCP.
@@ -109,11 +109,15 @@ class BlackijeckyServer:
         """
         try:
             data = conn.recv(1024)
-            if not data or len(data) < 38: return
+            if not data or len(data) < 38:
+                # Invalid or missing initial request -> terminate connection
+                raise ConnectionError("Invalid or missing initial request packet")
 
             # Request packet: MagicCookie(4) | MsgType(1) | Rounds(1) | TeamName(32)
             cookie, msg_type, rounds, team_name = struct.unpack('>IBB32s', data[:38])
-            if cookie != MAGIC_COOKIE or msg_type != REQUEST_TYPE: return
+            if cookie != MAGIC_COOKIE or msg_type != REQUEST_TYPE:
+                # Malformed request -> terminate connection
+                raise ConnectionError("Invalid magic cookie or message type in request")
 
             team_name = team_name.decode(errors='ignore').strip('\x00')
             print(f"\n🔥 [NEW PLAYER] Team '{team_name}' connected from {addr[0]}")
@@ -124,6 +128,7 @@ class BlackijeckyServer:
                 # Each client gets their own dealer deck which is reshuffled before each round
                 deck = self.new_shuffled_deck()
                 result = self.play_round(conn, team_name, deck)
+                # If play_round returns normally, update stats and print rate
                 self.update_global_stats(result)
 
             print(f"🤘 Session finished for {team_name}. Connection closing.")
@@ -162,21 +167,18 @@ class BlackijeckyServer:
         while player_sum <= 21:
             data = conn.recv(1024)
             if not data:
-                # client disconnected or sent empty payload: end player's turn
-                print("   [INFO] No data from client — ending player phase.")
-                break
+                # client disconnected or sent empty payload -> terminate connection
+                raise ConnectionError("Client disconnected during player phase")
 
             # Defensive: ensure we have at least 10 bytes for the decision packet
             if len(data) < 10:
-                print(f"   [WARN] Received short packet ({len(data)} bytes). Ignoring and ending player phase.")
-                break
+                raise ConnectionError(f"Received short decision packet ({len(data)} bytes)")
 
             # Unpack only the first 10 bytes (I, B, 5s)
             cookie, msg_type, decision_bytes = struct.unpack('>IB5s', data[:10])
             # Validate cookie and message type (expect PAYLOAD_TYPE)
             if cookie != MAGIC_COOKIE or msg_type != PAYLOAD_TYPE:
-                print("   [WARN] Invalid decision packet received. Ignoring and ending player phase.")
-                break
+                raise ConnectionError("Invalid decision packet (bad cookie or msg type)")
 
             decision = decision_bytes.decode(errors='ignore').strip('\x00').strip()
             print(f"   {team_name} chose to: {decision}")
@@ -184,11 +186,8 @@ class BlackijeckyServer:
                 r, s, v = self.draw_card_from_deck(deck)
                 player_sum += v
                 print(f"   -> Dealt rank {r}. {team_name} total is now {player_sum}.")
-                try:
-                    self.send_payload(conn, 0x0, r, s)
-                except Exception:
-                    print("   [ERROR] Failed to send card to client during Hit; ending round.")
-                    break
+                # send_payload will raise if it fails; let the exception propagate
+                self.send_payload(conn, 0x0, r, s)
             else:
                 break
 
