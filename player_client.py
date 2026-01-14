@@ -87,7 +87,7 @@ def start_client():
                 
                 display_stats(num_rounds, stats)
                 
-        except (socket.timeout, ConnectionError) as e:
+        except (socket.timeout, ConnectionError, ConnectionResetError, BrokenPipeError, OSError) as e:
             print(f"⚠️ Network error: {e}. Back to listening...")
         except ValueError:
             print("❌ Use numbers for rounds!")
@@ -167,8 +167,12 @@ def safe_recv(sock):
     `ConnectionError` so the caller (the main loop) can stop the session
     and return to server discovery.
     """
-    data = sock.recv(9)
-    if len(data) < 9:
+    try:
+        data = sock.recv(9)
+    except (ConnectionResetError, BrokenPipeError, OSError) as e:
+        raise ConnectionError(f"Socket error during recv: {e}")
+
+    if not data or len(data) < 9:
         # Let the caller handle the disconnection
         raise ConnectionError("Server disconnected mid-round")
 
